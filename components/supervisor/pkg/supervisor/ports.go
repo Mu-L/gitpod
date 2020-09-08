@@ -5,6 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -13,7 +17,6 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/supervisor/api"
-	"github.com/google/tcpproxy"
 	"golang.org/x/xerrors"
 )
 
@@ -56,7 +59,9 @@ type portsManager struct {
 }
 
 type managedPort struct {
-	Internal      bool
+	Internal bool
+	Proxied  bool
+
 	LocalhostPort uint32
 	GloalPort     uint32
 	Proxy         io.Closer
@@ -139,7 +144,7 @@ func (pm *portsManager) ServedPorts() []*api.PortsStatus {
 func (pm *portsManager) getStatus() []*api.PortsStatus {
 	res := make([]*api.PortsStatus, 0, len(pm.state))
 	for _, p := range pm.state {
-		if p.Internal {
+		if p.Internal || p.Proxied {
 			continue
 		}
 
@@ -171,7 +176,7 @@ func (pm *portsManager) updateState(listeningPorts []netPort) {
 			LocalhostPort: p.Port,
 		}
 		if p.Localhost {
-			err := startTCPProxy(mp, openPorts)
+			err := startLocalhostProxy(mp, openPorts)
 			if err != nil {
 				log.WithError(err).WithField("port", p.Port).Warn("cannot start localhost proxy")
 			}
@@ -181,6 +186,7 @@ func (pm *portsManager) updateState(listeningPorts []netPort) {
 		}
 
 		pm.state[p.Port] = mp
+		pm.state[mp.GloalPort] = &managedPort{Proxied: true}
 		changes = true
 	}
 
@@ -201,10 +207,14 @@ func (pm *portsManager) updateState(listeningPorts []netPort) {
 		}
 
 		delete(pm.state, p)
+		if mp.Proxied {
+			// proxied ports don't trigger status changes
+			continue
+		}
+
 		changes = true
 	}
 
-	// TODO(cw): trigger listener updates once we support port status update listener
 	if !changes {
 		return
 	}
@@ -218,7 +228,7 @@ func (pm *portsManager) updateState(listeningPorts []netPort) {
 	}
 }
 
-func startTCPProxy(dst *managedPort, openPorts map[uint32]struct{}) (err error) {
+func startLocalhostProxy(dst *managedPort, openPorts map[uint32]struct{}) (err error) {
 	var proxyPort uint32
 	for prt := proxyPortRange.High; prt >= proxyPortRange.Low; prt-- {
 		if _, used := openPorts[prt]; used {
@@ -232,15 +242,35 @@ func startTCPProxy(dst *managedPort, openPorts map[uint32]struct{}) (err error) 
 		return xerrors.Errorf("cannot find a free proxy port")
 	}
 
-	var p tcpproxy.Proxy
-	p.AddRoute(fmt.Sprintf(":%d", proxyPort), tcpproxy.To(fmt.Sprintf("localhost:%d", dst.LocalhostPort)))
-
-	err = p.Start()
+	host := fmt.Sprintf("localhost:%d", dst.LocalhostPort)
+	dsturl, err := url.Parse("http://" + host)
 	if err != nil {
-		return xerrors.Errorf("cannot start proxy: %w", err)
+		return xerrors.Errorf("cannot produce proxy destination URL: %w", err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(dsturl)
+	od := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		req.Host = host
+		od(req)
+	}
+	proxyAddr := fmt.Sprintf(":%d", proxyPort)
+	lis, err := net.Listen("tcp", proxyAddr)
+	if err != nil {
+		return xerrors.Errorf("cannot listen on proxy port %d: %w", proxyPort, err)
 	}
 
-	dst.Proxy = &p
+	srv := &http.Server{
+		Addr:    proxyAddr,
+		Handler: proxy,
+	}
+	go func() {
+		err := srv.Serve(lis)
+		if err != nil {
+			log.WithError(err).WithField("local-port", dst.LocalhostPort).Error("localhost proxy failed")
+		}
+	}()
+
+	dst.Proxy = srv
 	dst.GloalPort = proxyPort
 	return nil
 }
